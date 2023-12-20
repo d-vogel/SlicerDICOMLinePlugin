@@ -1,398 +1,604 @@
+import glob, os, json
+from datetime import datetime
+import string
+import vtk, qt, ctk, slicer
+from DICOMLib import DICOMPlugin
+from DICOMLib import DICOMLoadable
 import logging
-import os
-from typing import Annotated, Optional
-
-import vtk
-
-import slicer
-from slicer.i18n import tr as _
-from slicer.i18n import translate
-from slicer.ScriptedLoadableModule import *
-from slicer.util import VTKObservationMixin
-from slicer.parameterNodeWrapper import (
-    parameterNodeWrapper,
-    WithinRange,
-)
-
-from slicer import vtkMRMLScalarVolumeNode
-
 
 #
-# DICOMLinePlugin
+# This is the plugin to handle translation of DICOM Surface SEG objects
 #
 
-class DICOMLinePlugin(ScriptedLoadableModule):
-    """Uses ScriptedLoadableModule base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+class DICOMSurfaceSegmentationPluginClass(DICOMPlugin):
+
+  def __init__(self,epsilon=0.01):
+    super(DICOMSurfaceSegmentationPluginClass,self).__init__()
+    self.loadType = "DICOMSurfaceSegmentation"
+
+    self.surfaceSegmentationSOPClassUID = "1.2.840.10008.5.1.4.1.1.66.5"
+
+    self.tags['seriesInstanceUID'] = "0020,000E"
+    self.tags['seriesDescription'] = "0008,103E"
+    self.tags['seriesNumber'] = "0020,0011"
+    self.tags['modality'] = "0008,0060"
+    self.tags['sopClassUID'] = "0008,0016"
+    self.tags['instanceUID'] = "0008,0018"
+
+  def examine(self,fileLists):
+    """ Returns a list of DICOMLoadable instances
+    corresponding to ways of interpreting the
+    fileLists parameter.
+    """
+    loadables = []
+    for files in fileLists:
+      loadables += self.examineFiles(files)
+    return loadables
+
+  def examineFiles(self,files):
+
+    """ Returns a list of DICOMLoadable instances
+    corresponding to ways of interpreting the
+    files parameter.
+    """
+    loadables = []
+
+    # just read the modality type; need to go to reporting logic, since DCMTK
+    #   is not wrapped ...
+
+    for cFile in files:
+
+      uid = slicer.dicomDatabase.fileValue(cFile, self.tags['instanceUID'])
+      if uid == '':
+        return []
+
+      desc = slicer.dicomDatabase.fileValue(cFile, self.tags['seriesDescription'])
+      if desc == '':
+        desc = "Unknown"
+
+      number = slicer.dicomDatabase.fileValue(cFile, self.tags['seriesNumber'])
+      if number == '':
+        number = "Unknown"
+
+      isSurfaceSeg = (slicer.dicomDatabase.fileValue(cFile, self.tags['sopClassUID']) == self.surfaceSegmentationSOPClassUID)
+
+      if isSurfaceSeg:
+        loadable = DICOMLoadable()
+        loadable.files = [cFile]
+        loadable.name = desc + ' - as a DICOM Surface SEG object'
+        loadable.tooltip = loadable.name
+        loadable.selected = True
+        loadable.confidence = 0.99
+        loadable.uid = uid
+        self.addReferences(loadable)
+        refName = self.referencedSeriesName(loadable)
+        if refName != "":
+          loadable.name = refName + " " + desc + " - SurfaceSegmentations"
+
+        loadables.append(loadable)
+
+        print('DICOM Surface SEG found')
+
+    return loadables
+
+  def referencedSeriesName(self,loadable):
+    """Returns the default series name for the given loadable"""
+    referencedName = "Unnamed Reference"
+    if hasattr(loadable, "referencedSeriesUID"):
+      referencedName = self.defaultSeriesNodeName(loadable.referencedSeriesUID)
+    return referencedName
+
+  def addReferences(self,loadable):
+    """Puts a list of the referenced UID into the loadable for use
+    in the node if this is loaded."""
+    import dicom
+    dcm = dicom.read_file(loadable.files[0])
+
+    if hasattr(dcm, "ReferencedSeriesSequence"):
+      # look up all of the instances in the series, since segmentation frames
+      #  may be non-contiguous
+      if hasattr(dcm.ReferencedSeriesSequence[0], "SeriesInstanceUID"):
+        loadable.referencedInstanceUIDs = []
+        for f in slicer.dicomDatabase.filesForSeries(dcm.ReferencedSeriesSequence[0].SeriesInstanceUID):
+          refDCM = dicom.read_file(f)
+          # this is a hack that should probably fixed in Slicer core - not all
+          #  of those instances are truly referenced!
+          loadable.referencedInstanceUIDs.append(refDCM.SOPInstanceUID)
+          loadable.referencedSeriesUID = dcm.ReferencedSeriesSequence[0].SeriesInstanceUID
+
+  def getValuesFromCodeSequence(self, segment, codeSequenceName, defaults=None):
+    try:
+      cs = segment[codeSequenceName]
+      return cs["CodeValue"], cs["CodingSchemeDesignator"], cs["CodeMeaning"]
+    except KeyError:
+      return defaults if defaults else ['', '', '']
+
+  def load(self,loadable):
+    """ Load the DICOM SEG object
+    """
+    print('DICOM SEG load()')
+    try:
+      uid = loadable.uid
+      print ('in load(): uid = ', uid)
+    except AttributeError:
+      return False
+
+    import dicom
+
+    dataset = dicom.read_file(loadable.files[0])
+    self.loadSurfaceSegmentationDataset(dataset)
+
+
+  def loadSurfaceSegmentationDataset(self,dataset):
+    """For testing:
+
+import dicom
+execfile('/Users/pieper/slicer4/latest/ExtensionsIndex-build/QuantitativeReporting/Py/DICOMSurfaceSegmentationPlugin.py')
+dataset = dicom.read_file('/Users/pieper/data/surface-seg/data/Series 001 [SEG - ProFuse segmentation of prostate]/1.3.6.1.4.1.30323.273440548164167.20160909.162908090.dcm')
+segPlugin = DICOMSurfaceSegmentationPluginClass()
+segPlugin.loadSurfaceSegmentationDataset(dataset)
+
     """
 
-    def __init__(self, parent):
-        ScriptedLoadableModule.__init__(self, parent)
-        self.parent.title = _("DICOMLinePlugin")  # TODO: make this more human readable by adding spaces
-        # TODO: set categories (folders where the module shows up in the module selector)
-        self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
-        self.parent.dependencies = []  # TODO: add here list of module names that this module requires
-        self.parent.contributors = ["John Doe (AnyWare Corp.)"]  # TODO: replace with "Firstname Lastname (Organization)"
-        # TODO: update with short description of the module and a link to online module documentation
-        # _() function marks text as translatable to other languages
-        self.parent.helpText = _("""
-This is an example of scripted loadable module bundled in an extension.
-See more information in <a href="https://github.com/organization/projectname#DICOMLinePlugin">module documentation</a>.
-""")
-        # TODO: replace with organization, grant and thanks
-        self.parent.acknowledgementText = _("""
-This file was originally developed by Jean-Christophe Fillion-Robin, Kitware Inc., Andras Lasso, PerkLab,
-and Steve Pieper, Isomics, Inc. and was partially funded by NIH grant 3P41RR013218-12S1.
-""")
+    for surface in dataset.SurfaceSequence:
+      coordinates = surface.SurfacePointsSequence[0].PointCoordinatesData
+      slicer.modules.coordinates = coordinates
 
-        # Additional initialization step after application startup is complete
-        slicer.app.connect("startupCompleted()", registerSampleData)
+      scene = slicer.mrmlScene
+
+      points = vtk.vtkPoints()
+      polyData = vtk.vtkPolyData()
+      polyData.SetPoints(points)
+
+      for pointIndex in xrange(len(coordinates)/3):
+        pointStart = pointIndex*3
+        point = coordinates[pointStart:pointStart+3]
+        point[0] *= -1
+        point[1] *= -1
+        points.InsertNextPoint(*point)
+
+      polys = vtk.vtkCellArray()
+      polyData.SetPolys(polys)
+
+      extremes = [100,1]
+      triIndices = surface.SurfaceMeshPrimitivesSequence[0].TrianglePointIndexList
+      triangles = len(triIndices)/6
+      for triangle in range(triangles):
+        polys.InsertNextCell(3)
+        for vertex in range(3):
+          vertexIndex = 6*triangle + 2*vertex;
+          low = ord(triIndices[vertexIndex])
+          high = ord(triIndices[vertexIndex+1])
+          index = (high << 8) + low
+          #print(low, high, index)
+          polys.InsertCellPoint(index)
+
+          if index < extremes[0]:
+            extremes[0] = index
+          if index > extremes[1]:
+            extremes[1] = index
+      print(extremes, len(coordinates)/3.)
+
+      # Create model node
+      model = slicer.vtkMRMLModelNode()
+      model.SetScene(scene)
+      model.SetName(scene.GenerateUniqueName("Segment-%d" % surface.SurfaceNumber))
+      model.SetAndObservePolyData(polyData)
+
+      # Create display node
+      modelDisplay = slicer.vtkMRMLModelDisplayNode()
+      genericAnatomy = slicer.util.getNode('GenericAnatomyColors')
+      color = [0,]*3
+      genericAnatomy.GetLookupTable().GetColor(surface.SurfaceNumber, color)
+      modelDisplay.SetColor(*color)
+      modelDisplay.SetScene(scene)
+      scene.AddNode(modelDisplay)
+      model.SetAndObserveDisplayNodeID(modelDisplay.GetID())
+
+      scene.AddNode(model)
+    return True
 
 
-#
-# Register sample data sets in Sample Data module
-#
+    comment = '''
+    
+    # Load terminology in the metafile into context
+    terminologiesLogic = slicer.modules.terminologies.logic()
+    terminologiesLogic.LoadTerminologyFromSurfaceSegmentDescriptorFile(loadable.name, metaFileName)
+    terminologiesLogic.LoadAnatomicContextFromSurfaceSegmentDescriptorFile(loadable.name, metaFileName)
 
-def registerSampleData():
+    with open(metaFileName) as metaFile:
+      data = json.load(metaFile)
+      logging.debug('number of segmentation files = ' + str(numberOfSurfaceSegments))
+      if numberOfSurfaceSegments != len(data["segmentAttributes"]):
+        logging.error('Loading failed: Inconsistent number of segments in the descriptor file and on disk')
+        return
+      for segmentAttributes in data["segmentAttributes"]:
+        # TODO: only handles the first item of lists
+        for segment in segmentAttributes:
+          # load each of the segments' segmentations
+          # Initialize color and terminology from .info file
+          # See SEG2NRRD.cxx and EncodeSEG.cxx for how it's written.
+          # Format of the .info file (no leading spaces, labelNum, RGBColor, SegmentedPropertyCategory and
+          # SegmentedPropertyCategory are required):
+          # labelNum;RGB:R,G,B;SegmentedPropertyCategory:code,scheme,meaning;SegmentedPropertyType:code,scheme,meaning;SegmentedPropertyTypeModifier:code,scheme,meaning;AnatomicRegion:code,scheme,meaning;AnatomicRegionModifier:code,scheme,meaning
+          # R, G, B are 0-255 in file, but mapped to 0-1 for use in color node
+          # set defaults in case of missing fields, modifiers are optional
+
+          try:
+            rgb255 = segment["recommendedDisplayRGBValue"]
+            rgb = map(lambda c: float(c) / 255., rgb255)
+          except KeyError:
+            rgb = (0., 0., 0.)
+
+          segmentId = segment["LabelID"]
+
+          defaults = ['T-D0050', 'Tissue', 'SRT']
+          categoryCode, categoryCodingScheme, categoryCodeMeaning = \
+            self.getValuesFromCodeSequence(segment, "SegmentedPropertyCategoryCodeSequence", defaults)
+
+          typeCode, typeCodingScheme, typeCodeMeaning = \
+            self.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeCodeSequence", defaults)
+
+          typeModCode, typeModCodingScheme, typeModCodeMeaning = \
+            self.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeModifierCodeSequence")
+
+          anatomicRegionDefaults = ['T-D0010', 'SRT', 'Entire Body']
+          regionCode, regionCodingScheme, regionCodeMeaning = \
+            self.getValuesFromCodeSequence(segment, "AnatomicRegionCodeSequence", anatomicRegionDefaults)
+
+          regionModCode, regionModCodingScheme, regionModCodeMeaning = \
+            self.getValuesFromCodeSequence(segment, "AnatomicRegionModifierCodeSequence")
+
+          dummyTerminologyWidget = slicer.qSlicerTerminologyNavigatorWidget() # Still cannot call static methods from python
+          segmentTerminologyTag = dummyTerminologyWidget.serializeTerminologyEntry(
+                                          loadable.name,
+                                          categoryCode, categoryCodingScheme, categoryCodeMeaning,
+                                          typeCode, typeCodingScheme, typeCodeMeaning,
+                                          typeModCode, typeModCodingScheme, typeModCodeMeaning,
+                                          loadable.name,
+                                          regionCode, regionCodingScheme, regionCodeMeaning,
+                                          regionModCode, regionModCodingScheme, regionModCodeMeaning)
+          # end of processing a line of terminology
+
+          # TODO: Create logic class that both CLI and this plugin uses so that we don't need to have temporary NRRD files and labelmap nodes
+          # if not hasattr(slicer.modules, 'segmentations'):
+
+          # load the segmentation volume file and name it for the reference series and segment color
+          labelFileName = os.path.join(outputDir, str(segmentId) + ".nrrd")
+          segmentName = seriesName + "-" + typeCodeMeaning + "-label"
+          (success, labelNode) = slicer.util.loadLabelVolume(labelFileName,
+                                                             properties={'name': segmentName},
+                                                             returnNode=True)
+          if not success:
+            raise ValueError("{} could not be loaded into Slicer!".format(labelFileName))
+          segmentLabelNodes.append(labelNode)
+          
+          # Set terminology properties as attributes to the label node (which is a temporary node)
+          #TODO: This is a quick solution, maybe there is a better one
+          labelNode.SetAttribute("Terminology", segmentTerminologyTag)
+          labelNode.SetAttribute("ColorR", str(rgb[0]))
+          labelNode.SetAttribute("ColorG", str(rgb[1]))
+          labelNode.SetAttribute("ColorB", str(rgb[2]))
+
+          # TODO: initialize referenced UID (and segment number?) attribute(s)
+          # dataset = dicom.read_file(segFileName)
+          # referencedSeries = dict()
+          # for refSeriesItem in dataset.ReferencedSeriesSequence:
+          #   refSOPInstanceUIDs = []
+          #   for refSOPInstanceItem in refSeriesItem.ReferencedInstanceSequence:
+          #     refSOPInstanceUIDs.append(refSOPInstanceItem.ReferencedSOPInstanceUID)
+          #   referencedSeries[refSeriesItem.SeriesInstanceUID] = refSOPInstanceUIDs
+          # segmentationNode.SetAttribute("DICOM.referencedInstanceUIDs", str(referencedSeries))
+
+          # create Subject hierarchy nodes for the loaded series
+          self.addSeriesInSubjectHierarchy(loadable, labelNode)
+
+      metaFile.close()
+
+    # TODO: the outputDir should be cleaned up
+
+    import vtkSegmentationCorePython as vtkSegmentationCore
+
+    segmentationNode = slicer.vtkMRMLSegmentationNode()
+    segmentationNode.SetName(seriesName)
+    slicer.mrmlScene.AddNode(segmentationNode)
+
+    segmentationDisplayNode = slicer.vtkMRMLSegmentationDisplayNode()
+    slicer.mrmlScene.AddNode(segmentationDisplayNode)
+    segmentationNode.SetAndObserveDisplayNodeID(segmentationDisplayNode.GetID())
+
+    segmentation = vtkSegmentationCore.vtkSegmentation()
+    segmentation.SetMasterRepresentationName(vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
+
+    segmentationNode.SetAndObserveSegmentation(segmentation)
+    self.addSeriesInSubjectHierarchy(loadable, segmentationNode)
+
+    for segmentLabelNode in segmentLabelNodes:
+      segment = vtkSegmentationCore.vtkSegment()
+      segment.SetName(segmentLabelNode.GetName())
+
+      segmentColor = [float(segmentLabelNode.GetAttribute("ColorR")), float(segmentLabelNode.GetAttribute("ColorG")), float(segmentLabelNode.GetAttribute("ColorB"))]
+      segment.SetDefaultColor(segmentColor)
+      
+      segment.SetTag(vtkSegmentationCore.vtkSegment.GetTerminologyEntryTagName(), segmentLabelNode.GetAttribute("Terminology"))
+
+      #TODO: when the logic class is created, this will need to be changed
+      orientedImage = slicer.vtkSlicerSegmentationsModuleLogic.CreateOrientedImageDataFromVolumeNode(segmentLabelNode)
+      segment.AddRepresentation(vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName(), orientedImage)
+      segmentation.AddSegment(segment)
+
+      segmentDisplayNode = segmentLabelNode.GetDisplayNode()
+      if segmentDisplayNode is not None:
+        slicer.mrmlScene.RemoveNode(segmentDisplayNode)
+      slicer.mrmlScene.RemoveNode(segmentLabelNode)
+
+    segmentation.CreateRepresentation(vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName(), True)
+    '''
+
+    return True
+
+  def examineForExport(self, node):
+
+    exportable = None
+
+    if node.GetAssociatedNode() and node.GetAssociatedNode().IsA('vtkMRMLSegmentationNode'):
+
+      # Check to make sure all referenced UIDs exist in the database.
+      instanceUIDs = node.GetAttribute("DICOM.ReferencedInstanceUIDs").split()
+      if instanceUIDs == "":
+          return []
+
+      for instanceUID in instanceUIDs:
+        inputDICOMImageFileName = slicer.dicomDatabase.fileForInstance(instanceUID)
+        if inputDICOMImageFileName == "":
+          return []
+
+      exportable = slicer.qSlicerDICOMExportable()
+      exportable.confidence = 1.0
+      exportable.setTag('Modality', 'SEG')
+
+    if exportable is not None:
+      exportable.name = self.loadType
+      exportable.tooltip = "Create DICOM files from segmentation"
+      exportable.nodeID = node.GetID()
+      exportable.pluginClass = self.__module__
+      # Define common required tags and default values
+      exportable.setTag('SeriesDescription', 'No series description')
+      exportable.setTag('SeriesNumber', '1')
+      return [exportable]
+
+    return []
+
+  def export(self, exportables):
+
+    exportablesCollection = vtk.vtkCollection()
+    for exportable in exportables:
+      vtkExportable = slicer.vtkSlicerDICOMExportable()
+      exportable.copyToVtkExportable(vtkExportable)
+      exportablesCollection.AddItem(vtkExportable)
+
+    self.exportAsDICOMSEG(exportablesCollection)
+
+  def exportAsDICOMSEG(self, exportablesCollection):
+    """Export the given node to a segmentation object and load it in the
+    DICOM database
+
+    This function was copied and modified from the EditUtil.py function of the same name in Slicer.
     """
-    Add data sets to Sample Data module.
-    """
-    # It is always recommended to provide sample data for users to make it easy to try the module,
-    # but if no sample data is available then this method (and associated startupCompeted signal connection) can be removed.
 
-    import SampleData
-    iconsPath = os.path.join(os.path.dirname(__file__), 'Resources/Icons')
+    import logging
 
-    # To ensure that the source code repository remains small (can be downloaded and installed quickly)
-    # it is recommended to store data sets that are larger than a few MB in a Github release.
+    if hasattr(slicer.modules, 'segmentations'):
 
-    # DICOMLinePlugin1
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category='DICOMLinePlugin',
-        sampleName='DICOMLinePlugin1',
-        # Thumbnail should have size of approximately 260x280 pixels and stored in Resources/Icons folder.
-        # It can be created by Screen Capture module, "Capture all views" option enabled, "Number of images" set to "Single".
-        thumbnailFileName=os.path.join(iconsPath, 'DICOMLinePlugin1.png'),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95",
-        fileNames='DICOMLinePlugin1.nrrd',
-        # Checksum to ensure file integrity. Can be computed by this command:
-        #  import hashlib; print(hashlib.sha256(open(filename, "rb").read()).hexdigest())
-        checksums='SHA256:998cb522173839c78657f4bc0ea907cea09fd04e44601f17c82ea27927937b95',
-        # This node name will be used when the data set is loaded
-        nodeNames='DICOMLinePlugin1'
-    )
+      exportable = exportablesCollection.GetItemAsObject(0)
+      subjectHierarchyNode = slicer.mrmlScene.GetNodeByID(exportable.GetNodeID())
 
-    # DICOMLinePlugin2
-    SampleData.SampleDataLogic.registerCustomSampleDataSource(
-        # Category and sample name displayed in Sample Data module
-        category='DICOMLinePlugin',
-        sampleName='DICOMLinePlugin2',
-        thumbnailFileName=os.path.join(iconsPath, 'DICOMLinePlugin2.png'),
-        # Download URL and target file name
-        uris="https://github.com/Slicer/SlicerTestingData/releases/download/SHA256/1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97",
-        fileNames='DICOMLinePlugin2.nrrd',
-        checksums='SHA256:1a64f3f422eb3d1c9b093d1a18da354b13bcf307907c66317e2463ee530b7a97',
-        # This node name will be used when the data set is loaded
-        nodeNames='DICOMLinePlugin2'
-    )
+      instanceUIDs = subjectHierarchyNode.GetAttribute("DICOM.ReferencedInstanceUIDs").split()
 
+      if instanceUIDs == "":
+        raise Exception("Editor master node does not have DICOM information")
 
-#
-# DICOMLinePluginParameterNode
-#
+      # get the list of source DICOM files
+      inputDICOMImageFileNames = ""
+      for instanceUID in instanceUIDs:
+        inputDICOMImageFileNames += slicer.dicomDatabase.fileForInstance(instanceUID) + ","
+      inputDICOMImageFileNames = inputDICOMImageFileNames[:-1] # strip last comma
 
-@parameterNodeWrapper
-class DICOMLinePluginParameterNode:
-    """
-    The parameters needed by module.
+      # save the per-structure volumes in the temp directory
+      inputSurfaceSegmentationsFileNames = ""
 
-    inputVolume - The volume to threshold.
-    imageThreshold - The value at which to threshold the input volume.
-    invertThreshold - If true, will invert the threshold.
-    thresholdedVolume - The output volume that will contain the thresholded volume.
-    invertedVolume - The output volume that will contain the inverted thresholded volume.
-    """
-    inputVolume: vtkMRMLScalarVolumeNode
-    imageThreshold: Annotated[float, WithinRange(-100, 500)] = 100
-    invertThreshold: bool = False
-    thresholdedVolume: vtkMRMLScalarVolumeNode
-    invertedVolume: vtkMRMLScalarVolumeNode
+      import random # TODO: better way to generate temp file names?
+      import vtkITK
+      writer = vtkITK.vtkITKImageWriter()
+      rasToIJKMatrix = vtk.vtkMatrix4x4()
 
+      import vtkSegmentationCore
+      import vtkSlicerSegmentationsModuleLogic
+      logic = vtkSlicerSegmentationsModuleLogic.vtkSlicerSegmentationsModuleLogic()
 
-#
-# DICOMLinePluginWidget
-#
+      segmentationNode = subjectHierarchyNode.GetAssociatedNode()
 
-class DICOMLinePluginWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
-    """Uses ScriptedLoadableModuleWidget base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    """
+      mergedSegmentationImageData = segmentationNode.GetImageData()
+      mergedSegmentationLabelmapNode = slicer.vtkMRMLLabelMapVolumeNode()
 
-    def __init__(self, parent=None) -> None:
-        """
-        Called when the user opens the module the first time and the widget is initialized.
-        """
-        ScriptedLoadableModuleWidget.__init__(self, parent)
-        VTKObservationMixin.__init__(self)  # needed for parameter node observation
-        self.logic = None
-        self._parameterNode = None
-        self._parameterNodeGuiTag = None
+      segmentationNode.GetRASToIJKMatrix(rasToIJKMatrix)
+      mergedSegmentationLabelmapNode.SetRASToIJKMatrix(rasToIJKMatrix)
+      mergedSegmentationLabelmapNode.SetAndObserveImageData(mergedSegmentationImageData)
+      mergedSegmentationOrientedImageData = logic.CreateOrientedImageDataFromVolumeNode(mergedSegmentationLabelmapNode)
 
-    def setup(self) -> None:
-        """
-        Called when the user opens the module the first time and the widget is initialized.
-        """
-        ScriptedLoadableModuleWidget.setup(self)
+      segmentation = segmentationNode.GetSegmentation()
 
-        # Load widget from .ui file (created by Qt Designer).
-        # Additional widgets can be instantiated manually and added to self.layout.
-        uiWidget = slicer.util.loadUI(self.resourcePath('UI/DICOMLinePlugin.ui'))
-        self.layout.addWidget(uiWidget)
-        self.ui = slicer.util.childWidgetVariables(uiWidget)
+      segmentIDs = vtk.vtkStringArray()
+      segmentation.GetSegmentIDs(segmentIDs)
+      segmentationName = segmentationNode.GetName()
 
-        # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
-        # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
-        # "setMRMLScene(vtkMRMLScene*)" slot.
-        uiWidget.setMRMLScene(slicer.mrmlScene)
+      for i in range(0, segmentIDs.GetNumberOfValues()):
+        segmentID = segmentIDs.GetValue(i)
+        segment = segmentation.GetSegment(segmentID)
 
-        # Create logic class. Logic implements all computations that should be possible to run
-        # in batch mode, without a graphical user interface.
-        self.logic = DICOMLinePluginLogic()
+        segmentName = segment.GetName()
+        structureName = segmentName[len(segmentationName)+1:-1*len('-label')]
 
-        # Connections
+        structureFileName = structureName + str(random.randint(0,vtk.VTK_INT_MAX)) + ".nrrd"
+        filePath = os.path.join(slicer.app.temporaryPath, structureFileName)
+        writer.SetFileName(filePath)
 
-        # These connections ensure that we update parameter node when scene is closed
-        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self.onSceneStartClose)
-        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.EndCloseEvent, self.onSceneEndClose)
+        segmentImageData = segment.GetRepresentation(vtkSegmentationCore.vtkSegmentationConverter.GetSegmentationBinaryLabelmapRepresentationName())
+        paddedImageData = vtkSegmentationCore.vtkOrientedImageData()
+        vtkSegmentationCore.vtkOrientedImageDataResample.PadImageToContainImage(segmentImageData, mergedSegmentationOrientedImageData, paddedImageData)
 
-        # Buttons
-        self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
+        labelmapImageData = slicer.vtkMRMLLabelMapVolumeNode()
+        logic.CreateLabelmapVolumeFromOrientedImageData(paddedImageData, labelmapImageData)
 
-        # Make sure parameter node is initialized (needed for module reload)
-        self.initializeParameterNode()
+        writer.SetInputDataObject(labelmapImageData.GetImageData())
 
-    def cleanup(self) -> None:
-        """
-        Called when the application closes and the module widget is destroyed.
-        """
-        self.removeObservers()
+        labelmapImageData.GetRASToIJKMatrix(rasToIJKMatrix)
+        writer.SetRasToIJKMatrix(rasToIJKMatrix)
+        logging.debug("Saving to %s..." % filePath)
+        writer.Write()
+        inputSegmentationsFileNames += filePath + ","
+      inputSegmentationsFileNames = inputSegmentationsFileNames[:-1] # strip last comma
 
-    def enter(self) -> None:
-        """
-        Called each time the user opens this module.
-        """
-        # Make sure parameter node exists and observed
-        self.initializeParameterNode()
+      # save the per-structure volumes label attributes
+      colorNode = segmentationNode.GetNodeReference('colorNodeID')
 
-    def exit(self) -> None:
-        """
-        Called each time the user opens a different module.
-        """
-        # Do not react to parameter node changes (GUI will be updated when the user enters into the module)
-        if self._parameterNode:
-            self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
-            self._parameterNodeGuiTag = None
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
+      terminologyName = colorNode.GetAttribute("TerminologyName")
+      colorLogic = slicer.modules.colors.logic()
+      if not terminologyName or not colorLogic:
+        raise Exception("No terminology or color logic - cannot export")
 
-    def onSceneStartClose(self, caller, event) -> None:
-        """
-        Called just before the scene is closed.
-        """
-        # Parameter node will be reset, do not use it anymore
-        self.setParameterNode(None)
+      inputLabelAttributesFileNames = ""
 
-    def onSceneEndClose(self, caller, event) -> None:
-        """
-        Called just after the scene is closed.
-        """
-        # If this module is shown while the scene is closed then recreate a new parameter node immediately
-        if self.parent.isEntered:
-            self.initializeParameterNode()
+      for i in range(0, segmentIDs.GetNumberOfValues()):
+        segmentID = segmentIDs.GetValue(i)
+        segment = segmentation.GetSegment(segmentID)
 
-    def initializeParameterNode(self) -> None:
-        """
-        Ensure parameter node exists and observed.
-        """
-        # Parameter node stores all user choices in parameter values, node selections, etc.
-        # so that when the scene is saved and reloaded, these settings are restored.
+        segmentName = segment.GetName()
+        structureName = segmentName[len(segmentationName)+1:-1*len('-label')]
+        labelIndex = colorNode.GetColorIndexByName( structureName )
 
-        self.setParameterNode(self.logic.getParameterNode())
+        rgbColor = [0,]*4
+        colorNode.GetColor(labelIndex, rgbColor)
+        rgbColor = map(lambda e: e*255., rgbColor)
 
-        # Select default input nodes if nothing is selected yet to save a few clicks for the user
-        if not self._parameterNode.inputVolume:
-            firstVolumeNode = slicer.mrmlScene.GetFirstNodeByClass("vtkMRMLScalarVolumeNode")
-            if firstVolumeNode:
-                self._parameterNode.inputVolume = firstVolumeNode
-
-    def setParameterNode(self, inputParameterNode: Optional[DICOMLinePluginParameterNode]) -> None:
-        """
-        Set and observe parameter node.
-        Observation is needed because when the parameter node is changed then the GUI must be updated immediately.
-        """
-
-        if self._parameterNode:
-            self._parameterNode.disconnectGui(self._parameterNodeGuiTag)
-            self.removeObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
-        self._parameterNode = inputParameterNode
-        if self._parameterNode:
-            # Note: in the .ui file, a Qt dynamic property called "SlicerParameterName" is set on each
-            # ui element that needs connection.
-            self._parameterNodeGuiTag = self._parameterNode.connectGui(self.ui)
-            self.addObserver(self._parameterNode, vtk.vtkCommand.ModifiedEvent, self._checkCanApply)
-            self._checkCanApply()
-
-    def _checkCanApply(self, caller=None, event=None) -> None:
-        if self._parameterNode and self._parameterNode.inputVolume and self._parameterNode.thresholdedVolume:
-            self.ui.applyButton.toolTip = _("Compute output volume")
-            self.ui.applyButton.enabled = True
+        # get the attributes and convert to format CodeValue,CodeMeaning,CodingSchemeDesignator
+        # or empty strings if not defined
+        propertyCategoryWithColons = colorLogic.GetSegmentedPropertyCategory(labelIndex, terminologyName)
+        if propertyCategoryWithColons == '':
+          logging.debug ('ERROR: no segmented property category found for label ',str(labelIndex))
+          # Try setting a default as this section is required
+          propertyCategory = "C94970,NCIt,Reference Region"
         else:
-            self.ui.applyButton.toolTip = _("Select input and output volume nodes")
-            self.ui.applyButton.enabled = False
+          propertyCategory = propertyCategoryWithColons.replace(':',',')
 
-    def onApplyButton(self) -> None:
-        """
-        Run processing when user clicks "Apply" button.
-        """
-        with slicer.util.tryWithErrorDisplay(_("Failed to compute results."), waitCursor=True):
+        propertyTypeWithColons = colorLogic.GetSegmentedPropertyType(labelIndex, terminologyName)
+        propertyType = propertyTypeWithColons.replace(':',',')
 
-            # Compute output
-            self.logic.process(self.ui.inputSelector.currentNode(), self.ui.outputSelector.currentNode(),
-                               self.ui.imageThresholdSliderWidget.value, self.ui.invertOutputCheckBox.checked)
+        propertyTypeModifierWithColons = colorLogic.GetSegmentedPropertyTypeModifier(labelIndex, terminologyName)
+        propertyTypeModifier = propertyTypeModifierWithColons.replace(':',',')
 
-            # Compute inverted output (if needed)
-            if self.ui.invertedOutputSelector.currentNode():
-                # If additional output volume is selected then result with inverted threshold is written there
-                self.logic.process(self.ui.inputSelector.currentNode(), self.ui.invertedOutputSelector.currentNode(),
-                                   self.ui.imageThresholdSliderWidget.value, not self.ui.invertOutputCheckBox.checked, showResult=False)
+        anatomicRegionWithColons = colorLogic.GetAnatomicRegion(labelIndex, terminologyName)
+        anatomicRegion = anatomicRegionWithColons.replace(':',',')
 
+        anatomicRegionModifierWithColons = colorLogic.GetAnatomicRegionModifier(labelIndex, terminologyName)
+        anatomicRegionModifier = anatomicRegionModifierWithColons.replace(':',',')
 
-#
-# DICOMLinePluginLogic
-#
+        structureFileName = structureName + str(random.randint(0,vtk.VTK_INT_MAX)) + ".info"
+        filePath = os.path.join(slicer.app.temporaryPath, structureFileName)
 
-class DICOMLinePluginLogic(ScriptedLoadableModuleLogic):
-    """This class should implement all the actual
-    computation done by your module.  The interface
-    should be such that other python code can import
-    this class and make use of the functionality without
-    requiring an instance of the Widget.
-    Uses ScriptedLoadableModuleLogic base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    """
+        # EncodeSEG is expecting a file of format:
+        # labelNum;SegmentedPropertyCategory:codeValue,codeScheme,codeMeaning;SegmentedPropertyType:v,m,s etc
+        attributes = "%d" % labelIndex
+        attributes += ";SegmentedPropertyCategory:"+propertyCategory
+        if propertyType != "":
+          attributes += ";SegmentedPropertyType:" + propertyType
+        if propertyTypeModifier != "":
+          attributes += ";SegmentedPropertyTypeModifier:" + propertyTypeModifier
+        if anatomicRegion != "":
+          attributes += ";AnatomicRegion:" + anatomicRegion
+        if anatomicRegionModifier != "":
+          attributes += ";AnatomicRegionModifier:" + anatomicRegionModifier
+        attributes += ";SegmentAlgorithmType:AUTOMATIC"
+        attributes += ";SegmentAlgorithmName:SlicerSelfTest"
+        attributes += ";RecommendedDisplayRGBValue:%g,%g,%g" % tuple(rgbColor[:-1])
+        fp = open(filePath, "w")
+        fp.write(attributes)
+        fp.close()
+        logging.debug ("filePath: %s", filePath)
+        logging.debug ("attributes: %s", attributes)
+        inputLabelAttributesFileNames += filePath + ","
+      inputLabelAttributesFileNames = inputLabelAttributesFileNames[:-1] # strip last comma'''
 
-    def __init__(self) -> None:
-        """
-        Called when the logic class is instantiated. Can be used for initializing member variables.
-        """
-        ScriptedLoadableModuleLogic.__init__(self)
-
-    def getParameterNode(self):
-        return DICOMLinePluginParameterNode(super().getParameterNode())
-
-    def process(self,
-                inputVolume: vtkMRMLScalarVolumeNode,
-                outputVolume: vtkMRMLScalarVolumeNode,
-                imageThreshold: float,
-                invert: bool = False,
-                showResult: bool = True) -> None:
-        """
-        Run the processing algorithm.
-        Can be used without GUI widget.
-        :param inputVolume: volume to be thresholded
-        :param outputVolume: thresholding result
-        :param imageThreshold: values above/below this threshold will be set to 0
-        :param invert: if True then values above the threshold will be set to 0, otherwise values below are set to 0
-        :param showResult: show output volume in slice viewers
-        """
-
-        if not inputVolume or not outputVolume:
-            raise ValueError("Input or output volume is invalid")
-
-        import time
-        startTime = time.time()
-        logging.info('Processing started')
-
-        # Compute the thresholded output volume using the "Threshold Scalar Volume" CLI module
-        cliParams = {
-            'InputVolume': inputVolume.GetID(),
-            'OutputVolume': outputVolume.GetID(),
-            'ThresholdValue': imageThreshold,
-            'ThresholdType': 'Above' if invert else 'Below'
+      try:
+        user = os.environ['USER']
+      except KeyError:
+        user = "Unspecified"
+      segFileName = "editor_export.SEG" + str(random.randint(0,vtk.VTK_INT_MAX)) + ".dcm"
+      segFilePath = os.path.join(slicer.app.temporaryPath, segFileName)
+      # TODO: define a way to set parameters like description
+      # TODO: determine a good series number automatically by looking in the database
+      parameters = {
+        "inputDICOMImageFileNames": inputDICOMImageFileNames,
+        "inputSegmentationsFileNames": inputSegmentationsFileNames,
+        "inputLabelAttributesFileNames": inputLabelAttributesFileNames,
+        "readerId": user,
+        "sessionId": "1",
+        "timePointId": "1",
+        "seriesDescription": "SlicerEditorSEGExport",
+        "seriesNumber": "100",
+        "instanceNumber": "1",
+        "bodyPart": "HEAD",
+        "algorithmDescriptionFileName": "Editor",
+        "outputSEGFileName": segFilePath,
+        "skipEmptySlices": False,
+        "compress": False,
         }
-        cliNode = slicer.cli.run(slicer.modules.thresholdscalarvolume, None, cliParams, wait_for_completion=True, update_display=showResult)
-        # We don't need the CLI module node anymore, remove it to not clutter the scene with it
-        slicer.mrmlScene.RemoveNode(cliNode)
 
-        stopTime = time.time()
-        logging.info(f'Processing completed in {stopTime-startTime:.2f} seconds')
+      encodeSEG = slicer.modules.encodeseg
+      cliNode = None
+
+      cliNode = slicer.cli.run(encodeSEG, cliNode, parameters, delete_temporary_files=False)
+      waitCount = 0
+      while cliNode.IsBusy() and waitCount < 20:
+        slicer.util.delayDisplay( "Running SEG Encoding... %d" % waitCount, 1000 )
+        waitCount += 1
+
+      if cliNode.GetStatusString() != 'Completed':
+        raise Exception("encodeSEG CLI did not complete cleanly")
+
+      logging.info("Added segmentation to DICOM database (%s)", segFilePath)
+      slicer.dicomDatabase.insert(segFilePath)
 
 
 #
-# DICOMLinePluginTest
+# DICOMSurfaceSegmentationPlugin
 #
 
-class DICOMLinePluginTest(ScriptedLoadableModuleTest):
+class DICOMSurfaceSegmentationPlugin:
+  """
+  This class is the 'hook' for slicer to detect and recognize the plugin
+  as a loadable scripted module
+  """
+  def __init__(self, parent):
+    parent.title = "DICOM SurfaceSegmentation Object Import Plugin"
+    parent.categories = ["Developer Tools.DICOM Plugins"]
+    parent.contributors = ["Andrey Fedorov, BWH"]
+    parent.helpText = """
+    Plugin to the DICOM Module to parse and load DICOM SEG modality.
+    No module interface here, only in the DICOM module
     """
-    This is the test case for your scripted module.
-    Uses ScriptedLoadableModuleTest base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    parent.dependencies = ['DICOM', 'Colors']
+    parent.acknowledgementText = """
+    This DICOM Plugin was developed by
+    Andrey Fedorov, BWH.
+    and was partially funded by NIH grant U01CA151261.
     """
 
-    def setUp(self):
-        """ Do whatever is needed to reset the state - typically a scene clear will be enough.
-        """
-        slicer.mrmlScene.Clear()
-
-    def runTest(self):
-        """Run as few or as many tests as needed here.
-        """
-        self.setUp()
-        self.test_DICOMLinePlugin1()
-
-    def test_DICOMLinePlugin1(self):
-        """ Ideally you should have several levels of tests.  At the lowest level
-        tests should exercise the functionality of the logic with different inputs
-        (both valid and invalid).  At higher levels your tests should emulate the
-        way the user would interact with your code and confirm that it still works
-        the way you intended.
-        One of the most important features of the tests is that it should alert other
-        developers when their changes will have an impact on the behavior of your
-        module.  For example, if a developer removes a feature that you depend on,
-        your test should break so they know that the feature is needed.
-        """
-
-        self.delayDisplay("Starting the test")
-
-        # Get/create input data
-
-        import SampleData
-        registerSampleData()
-        inputVolume = SampleData.downloadSample('DICOMLinePlugin1')
-        self.delayDisplay('Loaded test data set')
-
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
-
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
-        logic = DICOMLinePluginLogic()
-
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
-
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay('Test passed')
+    # Add this extension to the DICOM module's list for discovery when the module
+    # is created.  Since this module may be discovered before DICOM itself,
+    # create the list if it doesn't already exist.
+    try:
+      slicer.modules.dicomPlugins
+    except AttributeError:
+      slicer.modules.dicomPlugins = {}
+    slicer.modules.dicomPlugins['DICOMSurfaceSegmentationPlugin'] = DICOMSurfaceSegmentationPluginClass
