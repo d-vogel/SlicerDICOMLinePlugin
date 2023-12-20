@@ -10,10 +10,10 @@ import logging
 # This is the plugin to handle translation of DICOM Surface SEG objects
 #
 
-class DICOMSurfaceSegmentationPluginClass(DICOMPlugin):
+class DICOMLinePluginClass(DICOMPlugin):
 
   def __init__(self,epsilon=0.01):
-    super(DICOMSurfaceSegmentationPluginClass,self).__init__()
+    super(DICOMLinePluginClass,self).__init__()
     self.loadType = "DICOMSurfaceSegmentation"
 
     self.surfaceSegmentationSOPClassUID = "1.2.840.10008.5.1.4.1.1.66.5"
@@ -91,7 +91,7 @@ class DICOMSurfaceSegmentationPluginClass(DICOMPlugin):
   def addReferences(self,loadable):
     """Puts a list of the referenced UID into the loadable for use
     in the node if this is loaded."""
-    import dicom
+    import pydicom as dicom
     dcm = dicom.read_file(loadable.files[0])
 
     if hasattr(dcm, "ReferencedSeriesSequence"):
@@ -123,7 +123,7 @@ class DICOMSurfaceSegmentationPluginClass(DICOMPlugin):
     except AttributeError:
       return False
 
-    import dicom
+    import pydicom as dicom
 
     dataset = dicom.read_file(loadable.files[0])
     self.loadSurfaceSegmentationDataset(dataset)
@@ -132,10 +132,10 @@ class DICOMSurfaceSegmentationPluginClass(DICOMPlugin):
   def loadSurfaceSegmentationDataset(self,dataset):
     """For testing:
 
-import dicom
-execfile('/Users/pieper/slicer4/latest/ExtensionsIndex-build/QuantitativeReporting/Py/DICOMSurfaceSegmentationPlugin.py')
+import pydicom as dicom
+execfile('/Users/pieper/slicer4/latest/ExtensionsIndex-build/QuantitativeReporting/Py/DICOMLinePlugin.py')
 dataset = dicom.read_file('/Users/pieper/data/surface-seg/data/Series 001 [SEG - ProFuse segmentation of prostate]/1.3.6.1.4.1.30323.273440548164167.20160909.162908090.dcm')
-segPlugin = DICOMSurfaceSegmentationPluginClass()
+segPlugin = DICOMLinePluginClass()
 segPlugin.loadSurfaceSegmentationDataset(dataset)
 
     """
@@ -571,10 +571,10 @@ segPlugin.loadSurfaceSegmentationDataset(dataset)
 
 
 #
-# DICOMSurfaceSegmentationPlugin
+# DICOMLinePlugin
 #
 
-class DICOMSurfaceSegmentationPlugin:
+class DICOMLinePlugin:
   """
   This class is the 'hook' for slicer to detect and recognize the plugin
   as a loadable scripted module
@@ -601,4 +601,4 @@ class DICOMSurfaceSegmentationPlugin:
       slicer.modules.dicomPlugins
     except AttributeError:
       slicer.modules.dicomPlugins = {}
-    slicer.modules.dicomPlugins['DICOMSurfaceSegmentationPlugin'] = DICOMSurfaceSegmentationPluginClass
+    slicer.modules.dicomPlugins['DICOMLinePlugin'] = DICOMLinePluginClass
